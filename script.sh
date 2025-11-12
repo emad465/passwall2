@@ -4,7 +4,7 @@
 # PassWall2 Smart Installer for OpenWrt
 # Author: Your GitHub Username
 # Description: Intelligent installer for PassWall2 with automatic detection
-# Version: 2.0.0 (Fixed & Enhanced)
+# Version: 2.1.0 (Production Ready - Fixed Repository Issue)
 ################################################################################
 
 # Colors for output
@@ -23,7 +23,6 @@ mkdir -p "$LOG_DIR" 2>/dev/null
 
 # Configuration
 PASSWALL2_REPO="xiaorouji/openwrt-passwall2"
-PACKAGES_REPO="xiaorouji/openwrt-passwall-packages"
 
 ################################################################################
 # Logging Functions
@@ -62,7 +61,7 @@ print_header() {
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║                                                                ║"
     echo "║        PassWall2 Smart Installer for OpenWrt                   ║"
-    echo "║                    Version 2.0.0                               ║"
+    echo "║                    Version 2.1.0                               ║"
     echo "║                                                                ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -70,20 +69,6 @@ print_header() {
 
 print_separator() {
     echo -e "${CYAN}----------------------------------------------------------------${NC}"
-}
-
-show_spinner() {
-    local pid=$1
-    local message=$2
-    local spinstr='|/-\'
-    while kill -0 "$pid" 2>/dev/null; do
-        local temp=${spinstr#?}
-        printf " [%c] %s" "$spinstr" "$message"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep 0.1
-        printf "\r"
-    done
-    printf "    \r"
 }
 
 ################################################################################
@@ -119,12 +104,12 @@ detect_system_info() {
     # Get CPU info
     CPU_MODEL=$(grep "model name" /proc/cpuinfo 2>/dev/null | head -n 1 | cut -d: -f2 | xargs)
     if [ -z "$CPU_MODEL" ]; then
-        CPU_MODEL=$(grep "system type" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
+        CPU_MODEL=$(grep "system type" /proc/cpuinfo 2>/dev/null | head -n 1 | cut -d: -f2 | xargs)
     fi
     log "INFO" "CPU Model: ${CPU_MODEL:-Unknown}"
     echo -e "CPU Model: ${GREEN}${CPU_MODEL:-Unknown}${NC}"
     
-    # Get memory info (compatible with OpenWrt)
+    # Get memory info (OpenWrt compatible)
     if [ -f /proc/meminfo ]; then
         TOTAL_MEM=$(awk '/MemTotal/ {printf("%.0f", $2/1024)}' /proc/meminfo 2>/dev/null)
         FREE_MEM=$(awk '/MemAvailable/ {printf("%.0f", $2/1024)}' /proc/meminfo 2>/dev/null)
@@ -182,6 +167,107 @@ check_passwall2_status() {
 }
 
 ################################################################################
+# Repository Setup - CRITICAL FIX
+################################################################################
+
+setup_passwall2_repository() {
+    log "INFO" "Setting up PassWall2 repository..."
+    echo -e "${BOLD}Configuring PassWall2 repository...${NC}"
+    
+    # Use kiddin9's repository - Most reliable source for PassWall2
+    local version="$OPENWRT_VERSION"
+    local arch="$OPENWRT_ARCH"
+    
+    if [ -z "$version" ] || [ -z "$arch" ]; then
+        log "ERROR" "Cannot detect OpenWrt version or architecture"
+        return 1
+    fi
+    
+    # Map architecture for repository
+    local repo_arch=""
+    case "$arch" in
+        "armv7l"|"arm")
+            repo_arch="arm_cortex-a7"
+            ;;
+        "aarch64_generic"|"aarch64")
+            repo_arch="aarch64_generic"
+            ;;
+        "x86_64")
+            repo_arch="x86_64"
+            ;;
+        "mips")
+            repo_arch="mips_24kc"
+            ;;
+        "mipsel")
+            repo_arch="mipsel_24kc"
+            ;;
+        *)
+            log "ERROR" "Unsupported architecture: $arch"
+            echo -e "${RED}Error: Architecture $arch not supported${NC}"
+            return 1
+            ;;
+    esac
+    
+    # Determine repository version
+    local repo_version="23.05"  # Default
+    case "$version" in
+        23.05*) repo_version="23.05" ;;
+        22.03*) repo_version="22.03" ;;
+        21.02*) repo_version="21.02" ;;
+        *) 
+            log "WARNING" "OpenWrt $version not specifically supported, using 23.05"
+            echo -e "${YELLOW}⚠ Using 23.05 repository for compatibility${NC}"
+            ;;
+    esac
+    
+    # Configure repository
+    local repo_file="/etc/opkg/customfeeds.conf"
+    local backup_file="${repo_file}.bak.$(date +%Y%m%d)"
+    
+    # Backup if not already backed up
+    if [ ! -f "$backup_file" ]; then
+        cp "$repo_file" "$backup_file" 2>/dev/null
+        log "INFO" "Original repository file backed up to $backup_file"
+    fi
+    
+    # Remove old passwall/kiddin9 entries
+    sed -i '/kiddin9/d; /passwall/d; /xiaorouji/d' "$repo_file" 2>/dev/null
+    
+    # Add kiddin9 repository (most reliable source for PassWall2)
+    cat >> "$repo_file" << EOF
+# PassWall2 Repository - Added by Smart Installer
+src/gz kiddin9_packages https://op.dllkids.xyz/packages-${repo_version}/${repo_arch}
+src/gz kiddin9_base https://op.dllkids.xyz/packages-${repo_version}/base
+EOF
+    
+    log "SUCCESS" "Repository configured"
+    echo -e "${GREEN}✓ Repository added to $repo_file${NC}"
+    
+    # Add GPG key
+    echo -n "  Adding repository key... "
+    if wget-ssl --timeout=10 -O /tmp/opkg.key "https://op.dllkids.xyz/public.key" >> "$LOG_FILE" 2>&1; then
+        opkg-key add /tmp/opkg.key >> "$LOG_FILE" 2>&1
+        rm -f /tmp/opkg.key
+        echo -e "${GREEN}✓${NC}"
+    else
+        echo -e "${YELLOW}⚠${NC}"
+        log "WARNING" "Could not add GPG key, installation may still work"
+    fi
+    
+    # Update package lists
+    echo -n "  Updating package lists... "
+    if opkg update >> "$LOG_FILE" 2>&1; then
+        log "SUCCESS" "Package lists updated"
+        echo -e "${GREEN}✓${NC}"
+    else
+        log "WARNING" "Package list update had warnings"
+        echo -e "${YELLOW}⚠${NC}"
+    fi
+    
+    return 0
+}
+
+################################################################################
 # Menu Functions
 ################################################################################
 
@@ -192,7 +278,7 @@ show_main_menu() {
     echo -e "  OpenWrt: ${GREEN}${OPENWRT_VERSION:-Unknown}${NC}"
     echo -e "  Architecture: ${GREEN}${OPENWRT_ARCH:-$SYSTEM_ARCH}${NC}"
     echo -e "  Free Space: ${GREEN}${ROOT_AVAIL:-Unknown}${NC}"
-    echo -e "  Internet: $((INTERNET_CONNECTED == 1)) && echo -e "${GREEN}Connected${NC}" || echo -e "${RED}Disconnected${NC}")"
+    echo -e "  Internet: $([ "$INTERNET_CONNECTED" -eq 1 ] && echo -e "${GREEN}Connected${NC}" || echo -e "${RED}Disconnected${NC}")"
     
     if [ "$PASSWALL2_INSTALLED" -eq 1 ]; then
         echo -e "  PassWall2: ${GREEN}Installed${NC} (Version: ${INSTALLED_VERSION:-Unknown})"
@@ -305,129 +391,54 @@ check_prerequisites() {
     fi
 }
 
-update_package_lists() {
-    log "INFO" "Updating package lists..."
-    echo -e "${BOLD}Updating package lists...${NC}"
-    
-    if opkg update >> "$LOG_FILE" 2>&1; then
-        log "SUCCESS" "Package lists updated successfully"
-        echo -e "${GREEN}✓ Package lists updated${NC}"
-        return 0
-    else
-        log "ERROR" "Failed to update package lists"
-        echo -e "${RED}✗ Failed to update package lists${NC}"
-        echo "Check log file: $LOG_FILE"
-        return 1
-    fi
-}
-
-install_dependencies() {
-    log "INFO" "Installing dependencies..."
-    echo -e "${BOLD}Installing prerequisites...${NC}"
-    
-    # Essential dependencies for PassWall2
-    local deps=(
-        "ca-bundle"
-        "ca-certificates"
-        "libustream-openssl"
-        "wget-ssl"
-        "curl"
-        "iptables"
-        "ip6tables"
-        "dnsmasq-full"
-    )
-    
-    local installed_count=0
-    for dep in "${deps[@]}"; do
-        if opkg list-installed 2>/dev/null | grep -q "^${dep} "; then
-            log "INFO" "Dependency already installed: $dep"
-        else
-            echo -n "  Installing $dep... "
-            if opkg install "$dep" >> "$LOG_FILE" 2>&1; then
-                log "SUCCESS" "Installed dependency: $dep"
-                echo -e "${GREEN}✓${NC}"
-                installed_count=$((installed_count + 1))
-            else
-                log "WARNING" "Failed to install dependency: $dep"
-                echo -e "${YELLOW}⚠${NC}"
-            fi
-        fi
-    done
-    
-    log "SUCCESS" "Dependencies check completed. Installed: $installed_count"
-    return 0
-}
-
-get_latest_release() {
-    log "INFO" "Fetching latest PassWall2 release information..."
-    echo -e "${BOLD}Checking for latest version...${NC}"
-    
-    # Try to get latest release from GitHub API (fixed URL)
-    local api_url="https://api.github.com/repos/${PASSWALL2_REPO}/releases/latest"
-    LATEST_VERSION=""
-    
-    if command -v curl >/dev/null 2>&1; then
-        LATEST_VERSION=$(curl -s --connect-timeout 10 "$api_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    elif command -v wget-ssl >/dev/null 2>&1; then
-        LATEST_VERSION=$(wget-ssl --timeout=10 -qO- "$api_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    fi
-    
-    if [ -n "$LATEST_VERSION" ]; then
-        log "INFO" "Latest version available: $LATEST_VERSION"
-        echo -e "Latest version: ${GREEN}$LATEST_VERSION${NC}"
-        return 0
-    else
-        log "WARNING" "Could not fetch latest version from GitHub"
-        echo -e "${YELLOW}⚠ Could not check latest version, will use opkg repository${NC}"
-        return 1
-    fi
-}
-
 install_passwall2_packages() {
-    log "INFO" "Installing PassWall2 packages..."
+    log "INFO" "Starting PassWall2 package installation..."
     print_separator
     echo -e "${BOLD}Installing PassWall2...${NC}"
     print_separator
     
-    # Install core package first
-    echo -e "\n${CYAN}Installing main PassWall2 package...${NC}"
-    echo -n "  Installing luci-app-passwall2... "
+    # CRITICAL: Setup repository first
+    if ! setup_passwall2_repository; then
+        log "ERROR" "Repository setup failed"
+        echo -e "${RED}Error: Cannot configure repository${NC}"
+        echo -e "${YELLOW}Please ensure you have internet connectivity and try again${NC}"
+        return 1
+    fi
+    
+    # Now install packages
+    echo -e "\n${CYAN}Installing main package...${NC}"
+    echo -n "  luci-app-passwall2... "
     
     if opkg install "luci-app-passwall2" >> "$LOG_FILE" 2>&1; then
-        log "SUCCESS" "Installed luci-app-passwall2"
+        log "SUCCESS" "Main package installed"
         echo -e "${GREEN}✓${NC}"
     else
-        log "ERROR" "Failed to install luci-app-passwall2"
-        echo -e "${RED}✗ Installation failed${NC}"
-        echo -e "${RED}This might be due to incompatible architecture or repository issues${NC}"
-        echo -e "${YELLOW}Please check the log file: $LOG_FILE${NC}"
+        log "ERROR" "Main package installation failed"
+        echo -e "${RED}✗ Failed${NC}"
+        echo -e "${RED}Please check the log file: $LOG_FILE${NC}"
+        echo -e "${YELLOW}Common issues:${NC}"
+        echo -e "  - Repository not accessible"
+        echo -e "  - Architecture mismatch"
+        echo -e "  - Insufficient storage space"
         return 1
     fi
     
     # Install language pack
-    echo -n "  Installing language pack... "
+    echo -n "  luci-i18n-passwall2-zh-cn... "
     if opkg install "luci-i18n-passwall2-zh-cn" >> "$LOG_FILE" 2>&1; then
-        log "SUCCESS" "Installed language pack"
+        log "SUCCESS" "Language pack installed"
         echo -e "${GREEN}✓${NC}"
     else
-        log "WARNING" "Language pack not available or failed to install"
+        log "WARNING" "Language pack not available"
         echo -e "${YELLOW}⚠${NC}"
     fi
     
-    # Install optional core packages (best effort)
-    echo -e "\n${CYAN}Installing optional core packages...${NC}"
-    local core_packages=(
-        "xray-core"
-        "v2ray-core"
-        "shadowsocks-rust-sslocal"
-        "shadowsocks-rust-ssserver"
-        "hysteria"
-        "tuic-client"
-    )
-    
+    # Install essential core packages
+    echo -e "\n${CYAN}Installing essential core packages...${NC}"
+    local core_packages=("xray-core" "dnsmasq-full")
     for package in "${core_packages[@]}"; do
-        if opkg list | grep -q "^${package}"; then
-            echo -n "  Installing $package... "
+        echo -n "  $package... "
+        if opkg list 2>/dev/null | grep -q "^$package"; then
             if opkg install "$package" >> "$LOG_FILE" 2>&1; then
                 log "SUCCESS" "Installed: $package"
                 echo -e "${GREEN}✓${NC}"
@@ -454,7 +465,8 @@ install_passwall2() {
     
     # Confirm installation
     echo -e "${YELLOW}PassWall2 will be installed on your system.${NC}"
-    echo -e "Estimated space required: ~15-20MB"
+    echo -e "This will add custom repositories and install required packages."
+    echo -e "Estimated space required: ~20-25MB"
     echo ""
     read -rp "Do you want to continue? (yes/no): " confirm
     
@@ -471,35 +483,18 @@ install_passwall2() {
         return 1
     fi
     
-    # Update package lists
-    if ! update_package_lists; then
-        read -rp "Press Enter to return to menu..."
-        show_main_menu
-        return 1
-    fi
-    
-    # Install dependencies
-    if ! install_dependencies; then
-        read -rp "Press Enter to return to menu..."
-        show_main_menu
-        return 1
-    fi
-    
-    # Get latest release info (optional)
-    get_latest_release
-    
-    # Install PassWall2 packages
+    # Install packages
     if ! install_passwall2_packages; then
         read -rp "Press Enter to return to menu..."
         show_main_menu
         return 1
     fi
     
-    # Wait a moment for LuCI to refresh
+    # Wait for LuCI to refresh
     echo -e "\n${CYAN}Finalizing installation...${NC}"
     sleep 3
     
-    # Final success message
+    # Success message
     print_separator
     echo -e "${GREEN}${BOLD}✓ PassWall2 installed successfully!${NC}"
     print_separator
@@ -610,8 +605,8 @@ uninstall_passwall2_internal() {
     log "INFO" "Uninstalling PassWall2..."
     echo -e "\n${BOLD}Removing PassWall2 packages...${NC}"
     
-    # Get all passwall2 related packages (more specific)
-    local packages=$(opkg list-installed 2>/dev/null | grep -E "passwall2|luci-app-passwall2" | awk '{print $1}')
+    # Get all passwall2 related packages
+    local packages=$(opkg list-installed 2>/dev/null | grep -E "luci-app-passwall2|luci-i18n-passwall2" | awk '{print $1}')
     
     if [ -z "$packages" ]; then
         log "INFO" "No PassWall2 packages found to remove"
@@ -653,7 +648,7 @@ uninstall_passwall2() {
     
     uninstall_passwall2_internal
     
-    # Also remove core packages that were installed with PassWall2
+    # Also remove core packages that were likely installed with PassWall2
     echo -e "\n${BOLD}Removing associated core packages...${NC}"
     local core_packages=("xray-core" "v2ray-core" "hysteria" "tuic-client")
     for pkg in "${core_packages[@]}"; do
