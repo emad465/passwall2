@@ -1,42 +1,45 @@
 #!/bin/bash
 
 ################################################################################
-# PassWall2 Universal Installer for OpenWrt
-# Version: 3.0.0 (Final - Intelligent Architecture Detection)
-# Supports: ALL OpenWrt versions & ALL architectures without exception
+# PassWall2 Universal Smart Installer for OpenWrt
+# Based on: https://github.com/iranopenwrt/auto
+# Enhanced with: Interactive UI, Multi-source fallback, Full error handling
+# Version: 4.0.0 (Production Ready - Supports ALL architectures)
 ################################################################################
 
-# Colors
+# Terminal Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 BOLD='\033[1m'
 
-# Log
-LOG_DIR="/tmp/passwall2_installer"
-LOG_FILE="$LOG_DIR/install_$(date +%Y%m%d_%H%M%S).log"
-mkdir -p "$LOG_DIR" 2>/dev/null
+# Configuration
+LOG_FILE="/tmp/passwall2_install_$(date +%Y%m%d_%H%M%S).log"
+REPO_BASE="https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases"
+trap 'echo -e "\n${RED}Installation interrupted!${NC}"; exit 1' INT
 
 ################################################################################
-# Smart Logging
+# Smart Logging & UI System
 ################################################################################
 
 log() {
-    echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"
+    echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
-################################################################################
-# UI
-################################################################################
+info() { log "${BLUE}ℹ${NC} $*"; }
+success() { log "${GREEN}✓${NC} $*"; }
+warning() { log "${YELLOW}⚠${NC} $*"; }
+error() { log "${RED}✗${NC} $*"; exit 1; }
 
 print_header() {
     clear
     echo -e "${CYAN}${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║          PassWall2 Universal Installer v3.0.0               ║"
-    echo "║    Auto-Detects Repositories for ANY Architecture           ║"
+    echo "║         PassWall2 Universal Installer v4.0.0                ║"
+    echo "║   Auto-detects & Configures for ANY OpenWrt Architecture   ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -46,292 +49,343 @@ print_separator() {
 }
 
 ################################################################################
-# System Detection (Uses OpenWrt's NATIVE data)
+# System Intelligence Functions
 ################################################################################
+
+check_root() {
+    [ "$(id -u)" -ne 0 ] && error "Must run as root!"
+}
 
 detect_system() {
+    print_header
+    echo -e "${BOLD}🔍 Auto-Detecting System Architecture...${NC}"
     print_separator
-    echo -e "${BOLD}🔍 Detecting System...${NC}"
-    print_separator
     
-    # Get OpenWrt's EXACT architecture (no guessing!)
-    source /etc/openwrt_release 2>/dev/null
-    DIST_ARCH="$DISTRIB_ARCH"
-    DIST_TARGET="$DISTRIB_TARGET"
-    DIST_VERSION="$DISTRIB_RELEASE"
-    DIST_CODENAME="$DISTRIB_CODENAME"
+    . /etc/openwrt_release 2>/dev/null || error "Not an OpenWrt system"
     
-    if [ -z "$DIST_ARCH" ]; then
-        echo -e "${RED}❌ Could not detect OpenWrt architecture${NC}"
-        exit 1
-    fi
+    # Get native OpenWrt architecture (NO mapping needed!)
+    ARCH="$DISTRIB_ARCH"
+    TARGET="$DISTRIB_TARGET"
+    RELEASE="$DISTRIB_RELEASE"
+    MAJOR_RELEASE=$(echo "$DISTRIB_RELEASE" | cut -d. -f1,2)
+    DEVICE_MODEL=$(ubus call system board 2>/dev/null | jsonfilter -e '@.model' || echo "Unknown")
     
-    log "Architecture: $DIST_ARCH"
-    log "Target: $DIST_TARGET"
-    log "Version: $DIST_VERSION ($DIST_CODENAME)"
+    info "Device: ${GREEN}$DEVICE_MODEL${NC}"
+    info "Architecture: ${GREEN}$ARCH${NC}"
+    info "OpenWrt: ${GREEN}$RELEASE${NC}"
     
-    echo -e "Architecture: ${GREEN}$DIST_ARCH${NC}"
-    echo -e "Target: ${GREEN}$DIST_TARGET${NC}"
-    echo -e "Version: ${GREEN}$DIST_VERSION${NC}"
+    # Health check
+    ROOT_FREE=$(df / 2>/dev/null | awk 'NR==2 {printf "%.0f", $4/1024}' || echo 0)
+    [ "$ROOT_FREE" -lt 25000 ] && error "Insufficient space: ${ROOT_FREE}MB free (need 25MB+)"
     
-    # Detect internet
-    echo -n "Internet: "
-    if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
-        INTERNET_OK=1
-        echo -e "${GREEN}✓${NC}"
-        log "Internet: OK"
-    else
-        INTERNET_OK=0
-        echo -e "${RED}✗${NC}"
-        log "Internet: Failed"
-    fi
+    # Internet check with multiple fallbacks
+    for host in 8.8.8.8 1.1.1.1 208.67.222.222; do
+        ping -c 1 -W 3 "$host" >/dev/null 2>&1 && break
+    done || error "No internet connectivity!"
     
+    success "System check passed"
     print_separator
 }
 
 ################################################################################
-# Repository Setup (INTELLIGENT - No Hardcoded Architecture)
+# Core Installation Engine (From iranopenwrt/auto - Enhanced)
 ################################################################################
 
-setup_repositories() {
-    echo -e "${BOLD}📦 Setting up Repositories...${NC}"
-    print_separator
+setup_dnsmasq() {
+    echo -e "${BOLD}🔄 Step 1: DNSMasq Optimization${NC}"
     
-    # Use OpenWrt's EXACT major version
-    MAJOR_VERSION=$(echo "$DIST_VERSION" | cut -d. -f1-2)
-    
-    # Backup
-    REPO_FILE="/etc/opkg/customfeeds.conf"
-    BACKUP_FILE="${REPO_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
-    
-    if [ ! -f "$BACKUP_FILE" ]; then
-        cp "$REPO_FILE" "$BACKUP_FILE" 2>/dev/null
-        log "Repository backup: $BACKUP_FILE"
-        echo -e "Backup: ${GREEN}$BACKUP_FILE${NC}"
+    if is_installed "dnsmasq-full"; then
+        success "dnsmasq-full already installed"
+        return 0
     fi
+    
+    info "Replacing dnsmasq with dnsmasq-full..."
+    is_installed "dnsmasq" && opkg remove dnsmasq --force-removal-of-dependent-packages
+    
+    opkg install dnsmasq-full --force-overwrite
+    [ $? -eq 0 ] && success "dnsmasq-full installed" || error "dnsmasq-full installation failed"
+}
+
+install_prerequisites() {
+    echo -e "\n${BOLD}🔧 Step 2: Core Dependencies${NC}"
+    
+    local pkgs="kmod-nft-tproxy kmod-nft-socket wget-ssl ip-full kmod-inet-diag kmod-netlink-diag kmod-tun unzip"
+    
+    for pkg in $pkgs; do
+        is_installed "$pkg" && continue
+        
+        echo -n "Installing $pkg... "
+        if opkg install "$pkg" &>/dev/null; then
+            success "$pkg"
+        else
+            warning "$pkg (optional)"
+        fi
+    done
+}
+
+setup_repository() {
+    echo -e "\n${BOLD}📦 Step 3: Repository Configuration${NC}"
+    
+    # Check if already configured and working
+    if opkg list 2>/dev/null | grep -q "luci-app-passwall2"; then
+        success "Repository already configured"
+        return 0
+    fi
+    
+    info "Configuring PassWall2 repository..."
     
     # Remove old entries
-    sed -i '/passwall2/d; /kiddin9/d; /immortalwrt/d; /iranopenwrt/d; /openwrt-passwall/d' "$REPO_FILE" 2>/dev/null
+    sed -i '/openwrt-passwall-build/d; /SOURCEFORGE_PASSWALL/d; /passwall2_pub/d' /etc/opkg/customfeeds.conf
     
-    # Add SMART repositories that use OpenWrt's NATIVE architecture string
-    cat >> "$REPO_FILE" << EOF
+    # Add repository (uses NATIVE architecture directly!)
+    cat >> /etc/opkg/customfeeds.conf << EOF
 
-# PassWall2 Repositories - Auto-Generated for $DIST_ARCH
-# Repository 1: kiddin9 (Primary - supports ALL architectures)
-src/gz kiddin9_packages https://op.dllkids.xyz/packages-${MAJOR_VERSION}/${DIST_ARCH}/packages
-src/gz kiddin9_luci https://op.dllkids.xyz/packages-${MAJOR_VERSION}/${DIST_ARCH}/luci
-
-# Repository 2: ImmortalWrt (Fallback - supports ALL architectures)
-src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/packages-${MAJOR_VERSION}/${DIST_ARCH}/packages
-src/gz immortalwrt_luci https://downloads.immortalwrt.org/releases/packages-${MAJOR_VERSION}/${DIST_ARCH}/luci
-
-# Repository 3: IranOpenWrt (Iran-Optimized)
-src/gz iranopenwrt_packages https://iranopenwrt.ir/releases/packages-${MAJOR_VERSION}/${DIST_ARCH}/packages
-src/gz iranopenwrt_luci https://iranopenwrt.ir/releases/packages-${MAJOR_VERSION}/${DIST_ARCH}/luci
-
-# Repository 4: OpenWrt-Passwall Direct (Ultimate Fallback)
-src/gz passwall_packages https://downloads.openwrt-passwall.site/releases/packages-${MAJOR_VERSION}/${DIST_ARCH}/packages
-src/gz passwall_luci https://downloads.openwrt-passwall.site/releases/packages-${MAJOR_VERSION}/${DIST_ARCH}/luci
+# PassWall2 Repository - Auto-configured for $ARCH
+src/gz SOURCEFORGE_PASSWALL $REPO_BASE/packages-${MAJOR_RELEASE}/${ARCH}/packages
 EOF
     
-    echo -e "Repositories: ${GREEN}✓ Added${NC}"
-    log "Repositories configured for $DIST_ARCH"
+    # Add GPG key (skip if exists)
+    if [ ! -f "/etc/opkg/keys/$(opkg-key fingerprint 2>/dev/null | grep -i passwall | awk '{print $2}')" ]; then
+        info "Adding repository key..."
+        wget -O /tmp/passwall2_pub.key "$REPO_BASE/passwall.pub" -q || \
+            error "Failed to download repository key!"
+        opkg-key add /tmp/passwall2_pub.key || warning "GPG key add failed (may still work)"
+        rm -f /tmp/passwall2_pub.key
+    fi
     
-    # Add GPG keys (best effort)
-    echo -n "GPG Keys: "
-    {
-        wget-ssl --timeout=10 -O- https://op.dllkids.xyz/public.key 2>/dev/null | opkg-key add - 2>/dev/null
-        wget-ssl --timeout=10 -O- https://downloads.immortalwrt.org/immortalwrt.gpg.key 2>/dev/null | opkg-key add - 2>/dev/null
-        wget-ssl --timeout=10 -O- https://iranopenwrt.ir/iranopenwrt.gpg.key 2>/dev/null | opkg-key add - 2>/dev/null
-    } >> "$LOG_FILE" 2>&1
+    # Update and verify
+    info "Updating package lists..."
+    opkg update &>/dev/null
     
-    echo -e "${GREEN}✓${NC}"
-    
-    # Update (show progress)
-    echo -n "Updating packages: "
-    if opkg update >> "$LOG_FILE" 2>&1; then
-        echo -e "${GREEN}✓${NC}"
-        log "Package list updated"
+    if opkg list 2>/dev/null | grep -q "luci-app-passwall2"; then
+        success "Repository ready"
         return 0
     else
-        echo -e "${YELLOW}⚠${NC}"
-        log "Update had warnings (this is normal)"
-        return 0  # Still continue
+        error "Repository setup failed! Check:"
+        error "- Architecture: $ARCH"
+        error "- URL: $REPO_BASE"
     fi
 }
 
-################################################################################
-# Package Search & Installation (INTELLIGENT)
-################################################################################
-
-find_and_install_passwall2() {
-    echo -e "\n${BOLD}🔍 Searching for PassWall2...${NC}"
-    print_separator
+install_passwall2_core() {
+    echo -e "\n${BOLD}🚀 Step 4: Installing PassWall2${NC}"
     
-    # Search ALL configured repositories
-    log "Searching for PassWall2 in repositories..."
+    is_installed "luci-app-passwall2" && success "PassWall2 already installed" && return 0
     
-    local pkg_info=$(opkg list 2>/dev/null | grep "luci-app-passwall2" | head -1)
+    info "Downloading PassWall2..."
+    opkg install luci-app-passwall2 &>/dev/null
     
-    if [ -z "$pkg_info" ]; then
-        echo -e "${RED}❌ PassWall2 NOT found in any repository${NC}"
-        echo ""
-        echo -e "${YELLOW}Possible reasons:${NC}"
-        echo -e "  1. Repository temporarily down"
-        echo -e "  2. Architecture very new/rare (wait for build)"
-        echo -e "  3. Network blocks (use VPN)"
-        echo ""
-        echo -e "${CYAN}Try manually:${NC}"
-        echo -e "  opkg list | grep passwall2"
-        log "PassWall2 not found in repos"
-        return 1
-    fi
-    
-    local pkg_name=$(echo "$pkg_info" | awk '{print $1}')
-    local pkg_version=$(echo "$pkg_info" | awk '{print $3}')
-    
-    echo -e "Found: ${GREEN}$pkg_name v$pkg_version${NC}"
-    log "Found: $pkg_name v$pkg_version"
-    
-    # INSTALL
-    echo -e "\n${BOLD}📥 Installing...${NC}"
-    print_separator
-    
-    echo -n "PassWall2 core: "
-    if opkg install "luci-app-passwall2" >> "$LOG_FILE" 2>&1; then
-        echo -e "${GREEN}✓${NC}"
-        log "PassWall2 installed successfully"
+    if [ $? -eq 0 ]; then
+        success "PassWall2 installed!"
+        
+        # Optional language pack
+        opkg install luci-i18n-passwall2-zh-cn &>/dev/null && success "Language pack added" || true
+        
+        # Core packages
+        echo -e "\n${CYAN}Installing core proxies...${NC}"
+        for pkg in xray-core v2ray-core; do
+            opkg install "$pkg" &>/dev/null && success "$pkg" || warning "$pkg (optional)"
+        done
     else
-        echo -e "${RED}✗${NC}"
-        log "PassWall2 installation failed"
-        return 1
+        error "PassWall2 installation failed! Check: $LOG_FILE"
     fi
+}
+
+install_iran_geosite() {
+    echo -e "\n${BOLD}🇮🇷 Optional: Iranian Geosite${NC}"
     
-    # Language pack (optional)
-    echo -n "Chinese pack: "
-    opkg install luci-i18n-passwall2-zh-cn >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}✓${NC}" || echo -e "${YELLOW}⚠${NC}"
+    read -rp "Install Iranian domain list for smarter routing? (yes/no): " answer
     
-    # Core packages (optional)
-    echo -e "\n${CYAN}Installing core packages...${NC}"
-    for pkg in xray-core v2ray-core; do
-        echo -n "  $pkg: "
-        opkg install "$pkg" >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}✓${NC}" || echo -e "${YELLOW}⚠${NC}"
+    [ "$answer" != "yes" ] && return 0
+    
+    info "Installing v2ray-geosite-ir..."
+    opkg install v2ray-geosite-ir &>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        success "Iran geosite installed"
+        
+        # Replace default config with Iran-optimized version
+        CONFIG_URL="https://github.com/iranopenwrt/auto/releases/latest/download/0_default_config_irhosted"
+        
+        if wget -O /tmp/pw2_config "$CONFIG_URL" -q; then
+            cp /tmp/pw2_config /usr/share/passwall2/0_default_config
+            cp /tmp/pw2_config /etc/config/passwall2
+            rm -f /tmp/pw2_config
+            success "Iran-optimized config applied"
+        else
+            warning "Could not download Iran config (manual setup needed)"
+        fi
+    else
+        warning "v2ray-geosite-ir not available in repository"
+    fi
+}
+
+configure_dns_rebind() {
+    echo -e "\n${BOLD}🛡️  Optional: DNS Rebind Protection Fix${NC}"
+    
+    read -rp "Fix DNS rebind for Iranian sites? (yes/no): " answer
+    
+    [ "$answer" != "yes" ] && return 0
+    
+    local domains="qmb.ir medu.ir tamin.ir ebanksepah.ir banksepah.ir gov.ir"
+    
+    info "Configuring DNS rebind exceptions..."
+    for domain in $domains; do
+        if uci get dhcp.@dnsmasq[0].rebind_domain 2>/dev/null | grep -q "$domain"; then
+            info "$domain already configured"
+        else
+            uci add_list dhcp.@dnsmasq[0].rebind_domain="$domain"
+            success "$domain added"
+        fi
     done
     
-    return 0
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart
+    success "DNS rebind configuration applied"
 }
 
 ################################################################################
-# Main Installation Flow
+# Complete Installation Workflow
 ################################################################################
 
-install_passwall2() {
+run_full_installation() {
+    print_header
+    detect_system
+    
+    echo -e "${BOLD}📋 Installation Summary:${NC}"
+    echo -e "  • Architecture: $ARCH"
+    echo -e "  • OpenWrt: $RELEASE"
+    echo -e "  • Space needed: ~25MB"
+    echo ""
+    read -rp "Start installation? (yes/no): " confirm
+    
+    [ "$confirm" != "yes" ] && show_menu
+    
+    setup_dnsmasq
+    install_prerequisites
+    setup_repository
+    install_passwall2_core
+    install_iran_geosite
+    configure_dns_rebind
+    
+    # Final message
+    print_separator
+    echo -e "${GREEN}${BOLD}✅ PASSWALL2 INSTALLED SUCCESSFULLY!${NC}"
+    print_separator
+    
+    LAN_IP=$(uci -q get network.lan.ipaddr || echo "192.168.1.1")
+    echo -e "🌐 Web UI: ${CYAN}http://${LAN_IP}/cgi-bin/luci/admin/services/passwall2${NC}"
+    echo -e "📄 Log File: ${BLUE}$LOG_FILE${NC}"
+    echo ""
+    echo -e "🚀 Next Steps:"
+    echo -e "  1. Access PassWall2 web interface"
+    echo -e "  2. Add your proxy nodes"
+    echo -e "  3. Configure routing rules"
+    echo -e "  4. Enable and start the service"
+    
+    print_separator
+    read -rp "Press Enter to continue..."
+}
+
+################################################################################
+# Management Functions
+################################################################################
+
+uninstall_passwall2() {
     print_header
     
-    if [ "$INTERNET_OK" -ne 1 ]; then
-        echo -e "${RED}❌ Internet connection required${NC}"
-        read -rp "Press Enter..."
-        return
+    read -rp "⚠️  Are you SURE you want to uninstall PassWall2? (yes/no): " confirm
+    
+    if [ "$confirm" = "yes" ]; then
+        info "Removing PassWall2..."
+        opkg remove luci-app-passwall2 --force-removal-of-dependent-packages &>/dev/null
+        
+        # Clean repository entries
+        sed -i '/openwrt-passwall-build/d; /SOURCEFORGE_PASSWALL/d' /etc/opkg/customfeeds.conf
+        
+        success "PassWall2 completely removed!"
+    fi
+}
+
+update_passwall2() {
+    print_header
+    
+    info "Updating PassWall2..."
+    opkg update &>/dev/null
+    opkg upgrade luci-app-passwall2 &>/dev/null
+    
+    [ $? -eq 0 ] && success "Update completed" || warning "Update failed"
+    read -rp "Press Enter..."
+}
+
+view_logs() {
+    print_header
+    
+    if [ -f "$LOG_FILE" ]; then
+        echo -e "${CYAN}📄 Installation Log:${NC}"
+        print_separator
+        tail -n 50 "$LOG_FILE"
+        print_separator
+    else
+        info "No log file found"
     fi
     
-    echo -e "${BOLD}📋 PassWall2 Installation${NC}"
-    print_separator
-    
-    echo -e "This will:"
-    echo -e "  • Add PassWall2 repositories"
-    echo -e "  • Update package lists"
-    echo -e "  • Install PassWall2 + dependencies"
-    echo -e "  • Required space: ~25MB"
-    echo ""
-    
-    read -rp "Continue? (yes/no): " confirm
-    
-    if [ "$confirm" != "yes" ]; then
-        show_main_menu
-        return
-    fi
-    
-    # Setup repos
-    setup_repositories || { read -rp "Press Enter..."; show_main_menu; return; }
-    
-    # Find and install
-    find_and_install_passwall2 || { read -rp "Press Enter..."; show_main_menu; return; }
-    
-    # Wait for LuCI
-    echo -e "\n${CYAN}Finalizing installation...${NC}"
-    sleep 3
-    
-    # Success
-    print_separator
-    echo -e "${GREEN}${BOLD}✅ PassWall2 Installed Successfully!${NC}"
-    print_separator
-    
-    LAN_IP=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
-    echo -e "🌐 Access: ${CYAN}http://${LAN_IP}/cgi-bin/luci/admin/services/passwall2${NC}"
-    echo -e "📄 Log: ${CYAN}$LOG_FILE${NC}"
-    
-    read -rp "Press Enter to continue..."
-    show_main_menu
+    read -rp "Press Enter..."
 }
 
 ################################################################################
-# Menu
+# Main Menu
 ################################################################################
 
 show_main_menu() {
-    print_header
-    
-    detect_system
-    
-    echo -e "${BOLD}📊 Status:${NC}"
-    
-    if opkg list-installed 2>/dev/null | grep -q "luci-app-passwall2"; then
-        INSTALLED_VER=$(opkg list-installed | grep "luci-app-passwall2" | awk '{print $3}')
-        echo -e "  PassWall2: ${GREEN}Installed (v$INSTALLED_VER)${NC}"
-        echo ""
-        echo "  1) Update"
-        echo "  2) Reinstall"
-        echo "  3) Uninstall"
-        echo "  4) View Logs"
-        echo "  5) Exit"
-        read -rp "Select [1-5]: " choice
+    while true; do
+        print_header
         
-        case $choice in
-            1) install_passwall2 ;;
-            2) install_passwall2 ;;
-            3) 
-                read -rp "Uninstall? (yes/no): " c
-                [ "$c" = "yes" ] && opkg remove luci-app-passwall2 --force-removal-of-dependent-packages >> "$LOG_FILE" 2>&1
-                show_main_menu
-                ;;
-            4) 
-                print_separator
-                tail -n 30 "$LOG_FILE"
-                print_separator
-                read -rp "Press Enter..."
-                show_main_menu
-                ;;
-            5) exit 0 ;;
-            *) show_main_menu ;;
-        esac
-    else
-        echo -e "  PassWall2: ${YELLOW}Not installed${NC}"
-        echo ""
+        # Check current status
+        if is_installed "luci-app-passwall2"; then
+            VER=$(opkg list-installed 2>/dev/null | grep "luci-app-passwall2" | awk '{print $3}')
+            echo -e "${BOLD}📊 Status:${NC} ${GREEN}Installed (v$VER)${NC}"
+        else
+            echo -e "${BOLD}📊 Status:${NC} ${YELLOW}Not Installed${NC}"
+        fi
+        
+        print_separator
+        echo -e "${BOLD}🎯 Options:${NC}"
         echo "  1) Install PassWall2"
-        echo "  2) Exit"
-        read -rp "Select [1-2]: " choice
+        echo "  2) Reinstall PassWall2"
+        echo "  3) Uninstall PassWall2"
+        echo "  4) Update PassWall2"
+        echo "  5) View Installation Log"
+        echo "  6) Exit"
+        print_separator
+        
+        read -rp "Select [1-6]: " choice
         
         case $choice in
-            1) install_passwall2 ;;
-            2) exit 0 ;;
-            *) show_main_menu ;;
+            1) run_full_installation ;;
+            2) uninstall_passwall2; run_full_installation ;;
+            3) uninstall_passwall2 ;;
+            4) update_passwall2 ;;
+            5) view_logs ;;
+            6) exit 0 ;;
+            *) warning "Invalid option!"; sleep 1 ;;
         esac
-    fi
+    done
 }
 
 ################################################################################
-# Start
+# Entry Point
 ################################################################################
 
-echo "$0" > /tmp/.pw2_install_running
-show_main_menu
+main() {
+    check_root
+    
+    # Redirect all output to log
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    
+    # Start
+    show_main_menu
+}
+
+# Run
+main "$@"
